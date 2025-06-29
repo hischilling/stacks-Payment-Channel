@@ -524,31 +524,28 @@
   )
     ;; Validate route
     (asserts! (> route-length u0) err-invalid-route)
+    (asserts! (is-eq route-length u1) err-invalid-route) ;; Only single hop supported
     
     ;; For single channel route
-    (if (is-eq route-length u1)
-      (let (
-        (channel-id (unwrap-panic (element-at route u0)))
-        (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (let (
+      (channel-id (unwrap-panic (element-at route u0)))
+      (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    )
+      ;; Verify this is a valid route
+      (asserts! (or 
+                 (and (is-eq sender (get participant1 channel)) (is-eq receiver (get participant2 channel)))
+                 (and (is-eq sender (get participant2 channel)) (is-eq receiver (get participant1 channel)))
+                ) 
+                err-invalid-route)
+      
+      ;; Create HTLC
+      (let ((htlc-result (try! (create-htlc channel-id receiver amount hashlock timelock))))
+        (ok {
+          hashlock: hashlock,
+          timelock: timelock,
+          htlc-id: htlc-result
+        })
       )
-        ;; Verify this is a valid route
-        (asserts! (or 
-                   (and (is-eq sender (get participant1 channel)) (is-eq receiver (get participant2 channel)))
-                   (and (is-eq sender (get participant2 channel)) (is-eq receiver (get participant1 channel)))
-                  ) 
-                  err-invalid-route)
-        
-        ;; Create HTLC
-        (let ((htlc-result (try! (create-htlc channel-id receiver amount hashlock timelock))))
-          (ok {
-            hashlock: hashlock,
-            timelock: timelock,
-            htlc-id: htlc-result
-          })
-        )
-      )
-      ;; Multi-hop not implemented in this simplified version
-      (err err-invalid-route)
     )
   )
 )
@@ -558,6 +555,116 @@
   (begin
     (try! (fulfill-htlc htlc-id preimage))
     (ok { preimage: preimage })
+  )
+)
+
+;; Channel Dispute Resolution - Commit 4: Non-cooperative channel closing
+
+;; Additional error constants for disputes
+(define-constant err-timelock-not-expired (err u107))
+
+;; Additional state variables for disputes
+(define-data-var dispute-timeout uint u1440) ;; ~10 days
+
+;; Initiate non-cooperative channel close
+(define-public (initiate-channel-close (channel-id uint))
+  (let (
+    (participant tx-sender)
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (participant1 (get participant1 channel))
+    (participant2 (get participant2 channel))
+  )
+    ;; Validations
+    (asserts! (is-eq (get state channel) u0) err-channel-closed)
+    (asserts! (or (is-eq participant participant1) (is-eq participant participant2)) err-not-authorized)
+    
+    ;; Set channel state to closing (1)
+    (map-set channels
+      { channel-id: channel-id }
+      (merge channel {
+        state: u1 ;; Closing state
+      })
+    )
+    
+    (ok { dispute-end-block: (+ block-height (var-get dispute-timeout)) })
+  )
+)
+
+;; Force settle channel after dispute period
+(define-public (force-settle-channel (channel-id uint))
+  (let (
+    (channel (unwrap! (map-get? channels { channel-id: channel-id }) err-channel-not-found))
+    (participant1 (get participant1 channel))
+    (participant2 (get participant2 channel))
+    (balance1 (get participant1-balance channel))
+    (balance2 (get participant2-balance channel))
+  )
+    ;; Validations
+    (asserts! (is-eq (get state channel) u1) err-invalid-state) ;; Must be in closing state
+    (asserts! (>= block-height (+ (get open-block channel) (var-get dispute-timeout))) err-timelock-not-expired)
+    
+    ;; Calculate fees
+    (let (
+      (fee1 (/ (* balance1 (var-get protocol-fee-percentage)) u10000))
+      (fee2 (/ (* balance2 (var-get protocol-fee-percentage)) u10000))
+      (final-balance1 (- balance1 fee1))
+      (final-balance2 (- balance2 fee2))
+    )
+      ;; Transfer balances
+      (as-contract (try! (stx-transfer? final-balance1 (as-contract tx-sender) participant1)))
+      (as-contract (try! (stx-transfer? final-balance2 (as-contract tx-sender) participant2)))
+      
+      ;; Update fee balance
+      (var-set protocol-fee-balance (+ (var-get protocol-fee-balance) (+ fee1 fee2)))
+      
+      ;; Update channel state to settled
+      (map-set channels
+        { channel-id: channel-id }
+        (merge channel {
+          state: u2,
+          participant1-balance: u0,
+          participant2-balance: u0,
+          capacity: u0
+        })
+      )
+      
+      (ok { 
+        participant1-balance: final-balance1, 
+        participant2-balance: final-balance2,
+        fee1: fee1,
+        fee2: fee2
+      })
+    )
+  )
+)
+
+;; Get channel status as string
+(define-read-only (get-channel-status (channel-id uint))
+  (let (
+    (channel (map-get? channels { channel-id: channel-id }))
+  )
+    (if (is-some channel)
+      (let ((state (get state (unwrap-panic channel))))
+        (if (is-eq state u0)
+          "Open"
+          (if (is-eq state u1)
+            "Closing"
+            "Settled"
+          )
+        )
+      )
+      "Not Found"
+    )
+  )
+)
+
+;; Update dispute timeout (admin only)
+(define-public (update-dispute-timeout (new-timeout uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-timeout u0) err-invalid-parameters)
+    (var-set dispute-timeout new-timeout)
+    (ok true)
   )
 )
 
